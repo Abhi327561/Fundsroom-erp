@@ -247,24 +247,57 @@ export const confirmChallan = async (req: Request, res: Response) => {
   }
 };
 
-// PATCH /challans/:id/cancel
+// PATCH /challans/:id/cancel — restocks if it was Confirmed
 export const cancelChallan = async (req: Request, res: Response) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    const challanResult = await pool.query('SELECT * FROM challans WHERE id = $1', [id]);
+    const userId = req.user?.id;
+
+    await client.query('BEGIN');
+    const challanResult = await client.query('SELECT * FROM challans WHERE id = $1 FOR UPDATE', [id]);
     if (challanResult.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Challan not found' });
     }
-    if (challanResult.rows[0].status === 'Cancelled') {
+    const challan = challanResult.rows[0];
+    if (challan.status === 'Cancelled') {
+      await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Challan is already cancelled' });
     }
 
-    // Note: if it was Confirmed, a real system would restock here.
-    // Kept simple for this case study -- documented as a known limitation.
-    const result = await pool.query(`UPDATE challans SET status = 'Cancelled' WHERE id = $1 RETURNING *`, [id]);
-    return res.status(200).json({ data: result.rows[0] });
+    if (challan.status === 'Confirmed') {
+      // Return stock for every line item + audit log
+      const itemsResult = await client.query('SELECT * FROM challan_items WHERE challan_id = $1', [id]);
+      const productIds = itemsResult.rows.map((i: any) => i.product_id);
+      if (productIds.length > 0) {
+        const productsResult = await client.query(
+          `SELECT * FROM products WHERE id = ANY($1::int[]) FOR UPDATE`,
+          [productIds]
+        );
+        const productsMap = new Map(productsResult.rows.map((p: any) => [p.id, p]));
+        for (const item of itemsResult.rows) {
+          const product = productsMap.get(item.product_id);
+          if (!product) continue;
+          const newStock = product.current_stock + item.quantity;
+          await client.query('UPDATE products SET current_stock = $1, updated_at = NOW() WHERE id = $2', [newStock, product.id]);
+          await client.query(
+            `INSERT INTO stock_movements (product_id, quantity_changed, movement_type, reason, created_by)
+             VALUES ($1,$2,'IN',$3,$4)`,
+            [product.id, item.quantity, `Challan ${challan.challan_number} cancelled (restock)`, userId]
+          );
+        }
+      }
+    }
+
+    const result = await client.query(`UPDATE challans SET status = 'Cancelled' WHERE id = $1 RETURNING *`, [id]);
+    await client.query('COMMIT');
+    return res.status(200).json({ data: result.rows[0], restocked: challan.status === 'Confirmed' });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('cancelChallan error:', err);
     return res.status(500).json({ error: 'Failed to cancel challan' });
+  } finally {
+    client.release();
   }
 };

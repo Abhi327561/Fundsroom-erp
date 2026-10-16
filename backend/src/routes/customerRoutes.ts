@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
 import {
-  getCustomers, getCustomerById, createCustomer, updateCustomer, addFollowUpNote,
+  getCustomers, getCustomerById, createCustomer, updateCustomer, addFollowUpNote, deleteCustomer,
 } from '../controllers/customerController';
 
 const router = Router();
@@ -15,5 +15,6 @@ router.get('/:id', getCustomerById);
 router.post('/', authorize('admin', 'sales'), createCustomer);
 router.put('/:id', authorize('admin', 'sales'), updateCustomer);
 router.post('/:id/notes', authorize('admin', 'sales'), addFollowUpNote);
+router.delete('/:id', authorize('admin'), deleteCustomer);
 
 export default router;

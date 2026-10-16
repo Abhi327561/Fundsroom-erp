@@ -16,15 +16,20 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// If the backend ever says the token is invalid/expired, log the user out
+// If the backend says the token is invalid/expired, log the user out
 // automatically instead of leaving them stuck on a broken page.
+// NOTE: never redirect for the login request itself — a failed login is
+// a normal 401 that Login.tsx must display, not wipe with a reload.
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
+    const isLoginRequest = error.config?.url?.includes('/auth/login');
+    if (error.response?.status === 401 && !isLoginRequest) {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
-      window.location.href = '/login';
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
     }
     return Promise.reject(error);
   }

@@ -196,3 +196,42 @@ export const getStockMovements = async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'Failed to fetch stock movements' });
   }
 };
+
+// GET /products-movements/all?limit=50 — global recent stock history for the Stock page + Dashboard
+export const getAllStockMovements = async (req: Request, res: Response) => {
+  try {
+    const limitNum = Math.min(Math.max(parseInt(req.query.limit as string) || 50, 1), 200);
+    const result = await pool.query(
+      `SELECT sm.*, p.product_name, p.sku, u.name as created_by_name
+       FROM stock_movements sm
+       LEFT JOIN products p ON sm.product_id = p.id
+       LEFT JOIN users u ON sm.created_by = u.id
+       ORDER BY sm.created_at DESC
+       LIMIT $1`,
+      [limitNum]
+    );
+    return res.status(200).json({ data: result.rows });
+  } catch (err) {
+    console.error('getAllStockMovements error:', err);
+    return res.status(500).json({ error: 'Failed to fetch stock history' });
+  }
+};
+
+// DELETE /products/:id
+export const deleteProduct = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query('SELECT id FROM products WHERE id = $1', [id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    await pool.query('DELETE FROM products WHERE id = $1', [id]);
+    return res.status(200).json({ message: 'Product deleted' });
+  } catch (err: any) {
+    if (err.code === '23503') {
+      return res.status(409).json({ error: 'Cannot delete: product is used in challans or stock movements.' });
+    }
+    console.error('deleteProduct error:', err);
+    return res.status(500).json({ error: 'Failed to delete product' });
+  }
+};

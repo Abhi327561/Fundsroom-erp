@@ -167,3 +167,23 @@ export const addFollowUpNote = async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'Failed to add follow-up note' });
   }
 };
+
+// DELETE /customers/:id
+export const deleteCustomer = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const existing = await pool.query('SELECT id FROM customers WHERE id = $1', [id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    await pool.query('DELETE FROM customers WHERE id = $1', [id]);
+    return res.status(200).json({ message: 'Customer deleted' });
+  } catch (err: any) {
+    // Referenced by a challan -> FK violation
+    if (err.code === '23503') {
+      return res.status(409).json({ error: 'Cannot delete: customer has challans. Set status to Inactive instead.' });
+    }
+    console.error('deleteCustomer error:', err);
+    return res.status(500).json({ error: 'Failed to delete customer' });
+  }
+};
