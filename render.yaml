@@ -1,6 +1,6 @@
 # Render Blueprint — one-click backend deploy.
 # Render Dashboard → New → Blueprint → select Fundsroom-erp repo.
-# Fill DATABASE_URL in the dashboard when prompted (Render generates JWT_SECRET).
+# Fill MONGODB_URI in the dashboard when prompted (Render generates JWT_SECRET).
 services:
   - type: web
     name: fundsroom-erp-backend
