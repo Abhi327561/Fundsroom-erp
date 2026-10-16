@@ -29,11 +29,13 @@ export const Login = () => {
     } catch (err: any) {
       const status = err.response?.status;
       setError(
-        status === 401
-          ? 'Invalid email or password. Check for typos and try again.'
-          : status === 429
-            ? 'Too many attempts. Wait 15 minutes and try again.'
-            : err.response?.data?.error || 'Login failed. Check your connection and try again.'
+        !err.response
+          ? 'Cannot reach the server. Check your internet connection and try again.'
+          : status === 401
+            ? 'Invalid email or password. Check for typos and try again.'
+            : status === 429
+              ? 'Too many attempts. Wait 15 minutes and try again.'
+              : err.response.data?.error || 'Login failed. Try again.'
       );
     } finally {
       setLoading(false);

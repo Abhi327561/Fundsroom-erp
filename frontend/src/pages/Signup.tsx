@@ -21,7 +21,13 @@ export const Signup = () => {
       localStorage.setItem('user', JSON.stringify(res.data.user));
       navigate('/');
     } catch (err: any) {
-      setError(err.response?.data?.error || 'Signup failed. Try again.');
+      if (!err.response) {
+        setError('Cannot reach the server. Check your internet connection and try again.');
+      } else if (err.response.status === 404) {
+        setError('This server version does not support signup yet. Please contact your administrator.');
+      } else {
+        setError(err.response.data?.error || 'Signup failed. Try again.');
+      }
     } finally {
       setLoading(false);
     }
