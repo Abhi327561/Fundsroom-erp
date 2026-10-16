@@ -17,7 +17,7 @@ services:
         value: https://fundsroom-erp-ruddy.vercel.app
       - key: JWT_EXPIRES_IN
         value: 8h
-      - key: DATABASE_URL
+      - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET
         generateValue: true

@@ -14,8 +14,8 @@ const required = (key: string): string => {
 const nodeEnv = process.env.NODE_ENV || 'development';
 const jwtSecret = process.env.JWT_SECRET || '';
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('Missing required env var: DATABASE_URL');
+if (!process.env.MONGODB_URI) {
+  throw new Error('Missing required env var: MONGODB_URI (e.g. mongodb+srv://user:pass@cluster/dbname)');
 }
 if (jwtSecret.length < 32) {
   throw new Error('JWT_SECRET must be at least 32 characters. Generate with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
@@ -25,7 +25,7 @@ export const env = {
   nodeEnv,
   isProd: nodeEnv === 'production',
   port: parseInt(process.env.PORT || '5000', 10),
-  databaseUrl: required('DATABASE_URL'),
+  mongoUri: required('MONGODB_URI'),
   jwtSecret,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '8h',
   // Comma-separated allowed origins, e.g. https://app.example.com,https://admin.example.com

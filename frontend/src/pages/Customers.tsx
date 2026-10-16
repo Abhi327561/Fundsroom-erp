@@ -9,7 +9,7 @@ import { useDebounce } from '../hooks/useDebounce';
 import { useAuth } from '../context/AuthContext';
 
 interface Customer {
-  id: number;
+  id: string;
   customer_name: string;
   mobile_number: string;
   email: string | null;

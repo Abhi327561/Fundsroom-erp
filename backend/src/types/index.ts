@@ -1,7 +1,7 @@
 export type UserRole = 'admin' | 'sales' | 'warehouse' | 'accounts';
 
 export interface User {
-  id: number;
+  id: string;
   name: string;
   email: string;
   password_hash: string;
@@ -10,7 +10,7 @@ export interface User {
 
 // What we put INSIDE the JWT token (never include password_hash here!)
 export interface JwtPayload {
-  id: number;
+  id: string;
   email: string;
   role: UserRole;
 }

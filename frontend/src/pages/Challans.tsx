@@ -7,11 +7,11 @@ import { useToast } from '../components/Toast';
 import { SkeletonTable } from '../components/Skeleton';
 import { useAuth } from '../context/AuthContext';
 
-interface Customer { id: number; customer_name: string; }
-interface Product { id: number; product_name: string; current_stock: number; unit_price: number; }
-interface ChallanItem { product_id: number; quantity: number; }
+interface Customer { id: string; customer_name: string; }
+interface Product { id: string; product_name: string; current_stock: number; unit_price: number; }
+interface ChallanItem { product_id: string; quantity: number; }
 interface Challan {
-  id: number;
+  id: string;
   challan_number: string;
   customer_name: string;
   total_quantity: number;
@@ -19,8 +19,8 @@ interface Challan {
   created_at: string;
 }
 interface ChallanDetail extends Challan {
-  customer_id: number;
-  items: { product_id: number; product_name_snapshot: string; unit_price_snapshot: number; quantity: number }[];
+  customer_id: string;
+  items: { product_id: string; product_name_snapshot: string; unit_price_snapshot: number; quantity: number }[];
 }
 
 export const Challans = () => {
@@ -33,7 +33,7 @@ export const Challans = () => {
   const [products, setProducts] = useState<Product[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [customerId, setCustomerId] = useState('');
-  const [items, setItems] = useState<ChallanItem[]>([{ product_id: 0, quantity: 1 }]);
+  const [items, setItems] = useState<ChallanItem[]>([{ product_id: '', quantity: 1 }]);
   const [statusFilter, setStatusFilter] = useState('');
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
@@ -68,28 +68,28 @@ export const Challans = () => {
     }
   }, [showForm]);
 
-  const addItemRow = () => setItems([...items, { product_id: 0, quantity: 1 }]);
+  const addItemRow = () => setItems([...items, { product_id: '', quantity: 1 }]);
   const removeItemRow = (index: number) => setItems(items.filter((_, i) => i !== index));
-  const updateItem = (index: number, field: keyof ChallanItem, value: number) => {
+  const updateItem = (index: number, field: keyof ChallanItem, value: string | number) => {
     const updated = [...items];
-    updated[index] = { ...updated[index], [field]: value };
+    updated[index] = { ...updated[index], [field]: value } as ChallanItem;
     setItems(updated);
   };
 
   // status: 'Draft' saves without touching stock, 'Confirmed' saves AND deducts stock immediately
   const handleCreate = async (status: 'Draft' | 'Confirmed') => {
-    const validItems = items.filter((i) => i.product_id > 0 && i.quantity > 0);
+    const validItems = items.filter((i) => i.product_id !== '' && i.quantity > 0);
     if (!customerId || validItems.length === 0) {
       toast('Select a customer and at least one product with quantity', 'error');
       return;
     }
     setSaving(true);
     try {
-      await api.post('/challans', { customer_id: parseInt(customerId), status, items: validItems });
+      await api.post('/challans', { customer_id: customerId, status, items: validItems });
       toast(status === 'Draft' ? 'Draft challan created' : 'Challan confirmed — stock deducted');
       setShowForm(false);
       setCustomerId('');
-      setItems([{ product_id: 0, quantity: 1 }]);
+      setItems([{ product_id: '', quantity: 1 }]);
       loadChallans();
     } catch (err: any) {
       toast(err.response?.data?.error || 'Failed to create challan', 'error');
@@ -98,7 +98,7 @@ export const Challans = () => {
     }
   };
 
-  const handleConfirm = async (id: number) => {
+  const handleConfirm = async (id: string) => {
     try {
       await api.patch(`/challans/${id}/confirm`);
       toast('Challan confirmed — stock deducted');
@@ -124,7 +124,7 @@ export const Challans = () => {
     }
   };
 
-  const openDetail = async (id: number) => {
+  const openDetail = async (id: string) => {
     try {
       const res = await api.get(`/challans/${id}`);
       setDetail(res.data.data);
@@ -161,8 +161,8 @@ export const Challans = () => {
 
             {items.map((item, index) => (
               <div className="item-row" key={index}>
-                <select value={item.product_id} onChange={(e) => updateItem(index, 'product_id', parseInt(e.target.value))}>
-                  <option value={0}>Select product...</option>
+                <select value={item.product_id} onChange={(e) => updateItem(index, 'product_id', e.target.value)}>
+                  <option value="">Select product...</option>
                   {products.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.product_name} (stock: {p.current_stock}, ₹{p.unit_price})

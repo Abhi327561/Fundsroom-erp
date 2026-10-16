@@ -1,28 +1,26 @@
 import bcrypt from 'bcryptjs';
 import dotenv from 'dotenv';
-import fs from 'fs';
-import path from 'path';
-import { pool } from './config/db';
+import mongoose from 'mongoose';
+import { env } from './config/env';
+import { User, Customer, Product, StockMovement, Challan, Counter } from './models/store';
 
 dotenv.config();
 
+const daysAgo = (n: number) => {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d;
+};
+
 // Run with: npm run seed
 // Idempotent demo seed: safe to re-run. Skips rows that already exist
-// (users/products by unique email/sku, customers by mobile, challans by number).
+// (users by email, products by SKU, customers by mobile, challans by number).
 // Spreads challans + movements over the last 13 days so Dashboard graphs look alive.
 const seed = async () => {
-  const client = await pool.connect();
   try {
+    mongoose.set('strictQuery', true);
+    await mongoose.connect(env.mongoUri);
     console.log('Seeding database...');
-
-    // 0. Ensure schema exists (first-run safety)
-    const schemaPath = path.join(__dirname, 'config', 'schema.sql');
-    if (fs.existsSync(schemaPath)) {
-      const schema = fs.readFileSync(schemaPath, 'utf8');
-      // CREATE TABLE without IF NOT EXISTS will throw if tables exist — ignore that case.
-      const guarded = schema.replace(/CREATE TABLE (\w+)/g, 'CREATE TABLE IF NOT EXISTS $1');
-      await client.query(guarded);
-    }
 
     const passwordHash = await bcrypt.hash('password123', 10);
 
@@ -34,19 +32,18 @@ const seed = async () => {
       { name: 'Accounts User', email: 'accounts@fundsroom.com', role: 'accounts' },
     ];
     for (const u of users) {
-      await client.query(
-        `INSERT INTO users (name, email, password_hash, role)
-         VALUES ($1,$2,$3,$4) ON CONFLICT (email) DO NOTHING`,
-        [u.name, u.email, passwordHash, u.role]
+      await User.updateOne(
+        { email: u.email },
+        { $setOnInsert: { name: u.name, email: u.email, password_hash: passwordHash, role: u.role } },
+        { upsert: true }
       );
     }
     console.log('Users seeded. All passwords: password123');
 
-    const adminId = (await client.query(`SELECT id FROM users WHERE email='admin@fundsroom.com'`)).rows[0]?.id;
-    const salesId = (await client.query(`SELECT id FROM users WHERE email='sales@fundsroom.com'`)).rows[0]?.id ?? adminId;
+    const admin = await User.findOne({ email: 'admin@fundsroom.com' });
+    const sales = (await User.findOne({ email: 'sales@fundsroom.com' })) ?? admin;
 
     // 2. Customers — 14 across types + statuses (skip if mobile already exists)
-    // [name, mobile, email, business, gst, type, address, status, followUpDaysFromNow|null, notes]
     const customers: any[][] = [
       ['Ravi Kumar', '9876543210', 'ravi@example.com', 'Ravi Traders', '27ABCDE1234F1Z5', 'Wholesale', 'Shop 12, APMC Market, Navi Mumbai', 'Active', null, 'Pays on time, prefers delivery mornings'],
       ['Sneha Enterprises', '9876500000', 'sneha@example.com', 'Sneha Enterprises', '27ABCDE5678G1Z5', 'Distributor', 'Plot 8, MIDC Bhosari, Pune', 'Active', 3, 'Quarterly contract renewal due'],
@@ -65,68 +62,67 @@ const seed = async () => {
     ];
     let customersAdded = 0;
     for (const c of customers) {
-      const exists = await client.query(`SELECT id FROM customers WHERE mobile_number = $1`, [c[1]]);
-      if (exists.rows.length > 0) continue;
-      await client.query(
-        `INSERT INTO customers (customer_name, mobile_number, email, business_name, gst_number, customer_type, address, status, follow_up_date, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8, CURRENT_DATE + ($9 || ' days')::interval, $10)`,
-        c
-      );
+      const exists = await Customer.exists({ mobile_number: c[1] });
+      if (exists) continue;
+      const followUp = c[8] === null || c[8] === undefined ? null : (() => { const d = new Date(); d.setDate(d.getDate() + Number(c[8])); return d; })();
+      await Customer.create({
+        customer_name: c[0], mobile_number: c[1], email: c[2], business_name: c[3], gst_number: c[4],
+        customer_type: c[5], address: c[6], status: c[7], follow_up_date: followUp, notes: c[9],
+      });
       customersAdded++;
     }
     console.log(`Customers seeded (+${customersAdded} new).`);
 
     // 3. Products — 16 across 5 categories (idempotent by SKU)
-    // [name, sku, category, price, stock, alert, location]
     const products: any[][] = [
       ['Steel Rod 12mm', 'SKU-STEEL-12', 'Construction', 550.0, 200, 20, 'Warehouse A'],
-      ['Steel Rod 8mm', 'SKU-STEEL-08', 'Construction', 480.0, 12, 30, 'Warehouse A'], // low
+      ['Steel Rod 8mm', 'SKU-STEEL-08', 'Construction', 480.0, 12, 30, 'Warehouse A'],
       ['Cement Bag 50kg', 'SKU-CEMENT-50', 'Construction', 380.0, 500, 50, 'Warehouse A'],
       ['Concrete Block 6inch', 'SKU-BLOCK-06', 'Construction', 65.0, 1200, 200, 'Yard'],
-      ['PVC Pipe 2inch', 'SKU-PVC-2IN', 'Plumbing', 120.0, 15, 20, 'Warehouse B'], // low
+      ['PVC Pipe 2inch', 'SKU-PVC-2IN', 'Plumbing', 120.0, 15, 20, 'Warehouse B'],
       ['CPVC Pipe 1inch', 'SKU-CPVC-1IN', 'Plumbing', 95.0, 220, 40, 'Warehouse B'],
-      ['Brass Tap Deluxe', 'SKU-TAP-BR01', 'Plumbing', 750.0, 8, 15, 'Warehouse B'], // low
+      ['Brass Tap Deluxe', 'SKU-TAP-BR01', 'Plumbing', 750.0, 8, 15, 'Warehouse B'],
       ['UPVC Elbow 2inch (pack of 10)', 'SKU-ELBOW-2IN', 'Plumbing', 210.0, 150, 30, 'Warehouse B'],
       ['Copper Wire 1.5sqmm 90m', 'SKU-WIRE-15', 'Electrical', 1850.0, 60, 10, 'Warehouse C'],
-      ['LED Panel 12W (pack of 4)', 'SKU-LED-12W', 'Electrical', 640.0, 9, 20, 'Warehouse C'], // low
+      ['LED Panel 12W (pack of 4)', 'SKU-LED-12W', 'Electrical', 640.0, 9, 20, 'Warehouse C'],
       ['MCB 32A Single Pole', 'SKU-MCB-32A', 'Electrical', 320.0, 110, 25, 'Warehouse C'],
       ['Switch Board 8M', 'SKU-SW-08M', 'Electrical', 450.0, 75, 15, 'Warehouse C'],
       ['Premium Emulsion 4L White', 'SKU-PAINT-EM4', 'Paints', 980.0, 85, 20, 'Warehouse A'],
-      ['Waterproof Primer 1L', 'SKU-PRIMER-1L', 'Paints', 260.0, 6, 25, 'Warehouse A'], // low
+      ['Waterproof Primer 1L', 'SKU-PRIMER-1L', 'Paints', 260.0, 6, 25, 'Warehouse A'],
       ['Hammer 500g', 'SKU-HAM-500', 'Hardware', 340.0, 140, 20, 'Warehouse C'],
       ['Drill Machine 13mm', 'SKU-DRILL-13', 'Hardware', 2450.0, 18, 8, 'Warehouse C'],
     ];
     let productsAdded = 0;
     for (const p of products) {
-      const r = await client.query(
-        `INSERT INTO products (product_name, sku, category, unit_price, current_stock, min_stock_alert, warehouse_location)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (sku) DO NOTHING`,
-        p
+      const r = await Product.updateOne(
+        { sku: p[1] },
+        {
+          $setOnInsert: {
+            product_name: p[0], sku: p[1], category: p[2], unit_price: p[3],
+            current_stock: p[4], min_stock_alert: p[5], warehouse_location: p[6],
+          },
+        },
+        { upsert: true }
       );
-      if (r.rowCount) productsAdded++;
+      if (r.upsertedCount) productsAdded++;
     }
     console.log(`Products seeded (+${productsAdded} new).`);
 
-    // 4. Opening-stock movements for products that have no history yet
-    const prods = (await client.query(`SELECT id, product_name FROM products`)).rows;
+    // 4. Opening-stock movements for products with no history yet
+    const prods = await Product.find({});
     let movementsAdded = 0;
     for (const p of prods) {
-      const has = await client.query(`SELECT id FROM stock_movements WHERE product_id = $1 LIMIT 1`, [p.id]);
-      if (has.rows.length > 0) continue;
-      const stock = (await client.query(`SELECT current_stock FROM products WHERE id = $1`, [p.id])).rows[0].current_stock;
-      if (stock > 0) {
-        await client.query(
-          `INSERT INTO stock_movements (product_id, quantity_changed, movement_type, reason, created_by, created_at)
-           VALUES ($1,$2,'IN','Opening stock (seed)',$3, NOW() - (random() * 20 || ' days')::interval)`,
-          [p.id, stock, adminId]
-        );
-        movementsAdded++;
-      }
+      const has = await StockMovement.exists({ product_id: p._id });
+      if (has || p.current_stock <= 0) continue;
+      await StockMovement.create({
+        product_id: p._id, quantity_changed: p.current_stock, movement_type: 'IN',
+        reason: 'Opening stock (seed)', created_by: admin!._id, created_at: daysAgo(Math.floor(Math.random() * 20)),
+      });
+      movementsAdded++;
     }
     console.log(`Opening stock movements (+${movementsAdded}).`);
 
-    // 5. Demo challans spread over 13 days — mix of Draft / Confirmed / Cancelled
-    // [challanNumber, customerMobile, status, daysAgo, items: [sku, qty][]]
+    // 5. Demo challans spread over 12 days — mix of Draft / Confirmed / Cancelled
     const challans: { no: string; mobile: string; status: string; daysAgo: number; items: [string, number][] }[] = [
       { no: 'CH-2026-900101', mobile: '9876543210', status: 'Confirmed', daysAgo: 12, items: [['SKU-CEMENT-50', 20], ['SKU-STEEL-12', 10]] },
       { no: 'CH-2026-900102', mobile: '9845012345', status: 'Confirmed', daysAgo: 10, items: [['SKU-PVC-2IN', 5], ['SKU-ELBOW-2IN', 10]] },
@@ -139,72 +135,61 @@ const seed = async () => {
     ];
     let challansAdded = 0;
     for (const ch of challans) {
-      const exists = await client.query(`SELECT id FROM challans WHERE challan_number = $1`, [ch.no]);
-      if (exists.rows.length > 0) continue;
-
-      const cust = (await client.query(`SELECT id FROM customers WHERE mobile_number = $1`, [ch.mobile])).rows[0];
+      if (await Challan.exists({ challan_number: ch.no })) continue;
+      const cust = await Customer.findOne({ mobile_number: ch.mobile });
       if (!cust) { console.log(`Skip ${ch.no}: customer ${ch.mobile} missing`); continue; }
 
-      await client.query('BEGIN');
       try {
-        const prodRows = [];
+        const lines: { productId: any; qty: number; name: string; price: number }[] = [];
         let totalQty = 0;
         for (const [sku, qty] of ch.items) {
-          const pr = (await client.query(`SELECT * FROM products WHERE sku = $1 FOR UPDATE`, [sku])).rows[0];
+          const pr: any = await Product.findOne({ sku });
           if (!pr) throw new Error(`product ${sku} missing`);
           if (ch.status === 'Confirmed' && qty > pr.current_stock) {
             throw new Error(`insufficient stock for ${sku}: have ${pr.current_stock}, need ${qty}`);
           }
-          prodRows.push({ ...pr, qty });
+          lines.push({ productId: pr._id, qty, name: pr.product_name, price: pr.unit_price });
           totalQty += qty;
         }
 
-        const chRes = await client.query(
-          `INSERT INTO challans (challan_number, customer_id, total_quantity, status, created_by, created_at)
-           VALUES ($1,$2,$3,$4,$5, NOW() - ($6 || ' days')::interval) RETURNING *`,
-          [ch.no, cust.id, totalQty, ch.status, ch.status === 'Draft' ? salesId : adminId, String(ch.daysAgo)]
-        );
-        const challan = chRes.rows[0];
+        const challan = await Challan.create({
+          challan_number: ch.no, customer_id: cust._id, total_quantity: totalQty,
+          status: ch.status, created_by: ch.status === 'Draft' ? sales!._id : admin!._id,
+          created_at: daysAgo(ch.daysAgo),
+          items: lines.map((l) => ({
+            product_id: l.productId, product_name_snapshot: l.name, unit_price_snapshot: l.price, quantity: l.qty,
+          })),
+        });
 
-        for (const pr of prodRows) {
-          await client.query(
-            `INSERT INTO challan_items (challan_id, product_id, product_name_snapshot, unit_price_snapshot, quantity)
-             VALUES ($1,$2,$3,$4,$5)`,
-            [challan.id, pr.id, pr.product_name, pr.unit_price, pr.qty]
-          );
-          if (ch.status === 'Confirmed') {
-            const newStock = pr.current_stock - pr.qty;
-            await client.query(`UPDATE products SET current_stock = $1, updated_at = NOW() WHERE id = $2`, [newStock, pr.id]);
-            await client.query(
-              `INSERT INTO stock_movements (product_id, quantity_changed, movement_type, reason, created_by, created_at)
-               VALUES ($1,$2,'OUT',$3,$4, NOW() - ($5 || ' days')::interval)`,
-              [pr.id, pr.qty, `Sales Challan ${ch.no}`, adminId, String(ch.daysAgo)]
-            );
+        if (ch.status === 'Confirmed') {
+          for (const l of lines) {
+            await Product.updateOne({ _id: l.productId }, { $inc: { current_stock: -l.qty } });
+            await StockMovement.create({
+              product_id: l.productId, quantity_changed: l.qty, movement_type: 'OUT',
+              reason: `Sales Challan ${ch.no}`, created_by: admin!._id, created_at: daysAgo(ch.daysAgo),
+            });
           }
         }
-
-        await client.query('COMMIT');
+        // Keep the yearly counter ahead of seeded numbers so generated numbers stay unique.
+        await Counter.updateOne({ year: 2026 }, { $max: { seq: 900108 } }, { upsert: true });
+        void challan;
         challansAdded++;
       } catch (e) {
-        await client.query('ROLLBACK');
         console.error(`Skip ${ch.no}:`, (e as Error).message);
       }
     }
+    // Ensure future generated numbers don't collide with anything already present.
     console.log(`Demo challans (+${challansAdded} new).`);
 
-    const counts = await client.query(`
-      SELECT (SELECT COUNT(*) FROM customers) AS customers,
-             (SELECT COUNT(*) FROM products) AS products,
-             (SELECT COUNT(*) FROM challans) AS challans,
-             (SELECT COUNT(*) FROM stock_movements) AS movements
-    `);
-    console.log('Totals:', counts.rows[0]);
+    const [c, p, ch, m] = await Promise.all([
+      Customer.countDocuments(), Product.countDocuments(), Challan.countDocuments(), StockMovement.countDocuments(),
+    ]);
+    console.log('Totals:', { customers: c, products: p, challans: ch, movements: m });
     console.log('Seeding complete.');
   } catch (err) {
     console.error('Seeding failed:', err);
   } finally {
-    client.release();
-    await pool.end();
+    await mongoose.disconnect();
   }
 };
 

@@ -1,25 +1,21 @@
-import { Pool } from 'pg';
-import dotenv from 'dotenv';
+import mongoose from 'mongoose';
+import { env } from './env';
 
-dotenv.config();
+// Single shared connection. Models in src/models/store.ts use it implicitly.
+export const connectDb = async () => {
+  if (mongoose.connection.readyState === 1) return;
+  mongoose.set('strictQuery', true);
+  await mongoose.connect(env.mongoUri);
+};
 
-// A "pool" keeps a set of reusable DB connections open,
-// instead of opening/closing a new connection on every request.
-// This is much faster and is the standard pattern for Node + Postgres.
-export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes('localhost')
-    ? false
-    : { rejectUnauthorized: false }, // needed for hosted DBs like Supabase/Neon/Render
-});
-
-// Quick helper to test the connection on server startup
 export const testConnection = async () => {
   try {
-    const result = await pool.query('SELECT NOW()');
-    console.log('Database connected successfully at', result.rows[0].now);
+    await connectDb();
+    const admin = mongoose.connection.db?.admin();
+    await admin?.ping();
+    console.log('MongoDB connected successfully to', mongoose.connection.name);
   } catch (err) {
-    console.error('Database connection failed:', err);
+    console.error('MongoDB connection failed:', err);
     process.exit(1);
   }
 };

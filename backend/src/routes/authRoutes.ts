@@ -57,7 +57,7 @@ router.patch(
   '/users/:id/role',
   authenticate,
   authorize('admin'),
-  [param('id').isInt().withMessage('Invalid user id'), body('role').isIn(ROLES).withMessage('Invalid role')],
+  [param('id').isMongoId().withMessage('Invalid user id'), body('role').isIn(ROLES).withMessage('Invalid role')],
   handleValidation,
   updateUserRole
 );

@@ -1,83 +1,118 @@
 import { Request, Response } from 'express';
-import { pool } from '../config/db';
+import { Customer, Product, Challan, StockMovement } from '../models/store';
+
+const dayKey = (d: Date) => d.toISOString().slice(0, 10);
+const dayLabel = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 
 // GET /analytics/dashboard — single payload powering all Dashboard graphs.
-// Keeps the frontend to 1 request instead of 6+.
 export const getDashboardAnalytics = async (_req: Request, res: Response) => {
   try {
-    const [
-      counts,
+    const [customers, products, challans, lowStock, invAgg] = await Promise.all([
+      Customer.countDocuments(),
+      Product.countDocuments(),
+      Challan.countDocuments(),
+      Product.countDocuments({ $expr: { $lte: ['$current_stock', '$min_stock_alert'] } }),
+      Product.aggregate([{ $group: { _id: null, total: { $sum: { $multiply: ['$unit_price', '$current_stock'] } } } }]),
+    ]);
+    const draftChallans = await Challan.countDocuments({ status: 'Draft' });
+
+    const [challansByStatus, customersByType, customersByStatus, stockByCategory] = await Promise.all([
+      Challan.aggregate([{ $group: { _id: '$status', value: { $sum: 1 } } }]).then((r) =>
+        r.map((x: any) => ({ name: x._id, value: x.value }))
+      ),
+      Customer.aggregate([{ $group: { _id: '$customer_type', value: { $sum: 1 } } }]).then((r) =>
+        r.map((x: any) => ({ name: x._id, value: x.value }))
+      ),
+      Customer.aggregate([{ $group: { _id: '$status', value: { $sum: 1 } } }]).then((r) =>
+        r.map((x: any) => ({ name: x._id, value: x.value }))
+      ),
+      Product.aggregate([
+        {
+          $group: {
+            _id: { $ifNull: ['$category', 'Uncategorized'] },
+            stock: { $sum: '$current_stock' },
+            value: { $sum: { $multiply: ['$unit_price', '$current_stock'] } },
+          },
+        },
+        { $sort: { value: -1 } },
+      ]).then((r) => r.map((x: any) => ({ name: x._id || 'Uncategorized', stock: x.stock, value: x.value }))),
+    ]);
+
+    // Last-14-day series, bucketed in JS (portable across Mongo versions).
+    const days: { key: string; day: string }[] = [];
+    for (let s = 13; s >= 0; s--) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - s);
+      days.push({ key: dayKey(d), day: dayLabel(d) });
+    }
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - 13);
+
+    const [recentChallans, recentMovements] = await Promise.all([
+      Challan.find({ created_at: { $gte: start } }).lean(),
+      StockMovement.find({ created_at: { $gte: start } }).lean(),
+    ]);
+
+    const challansTrend = days.map(({ key, day }) => {
+      const todays = recentChallans.filter((c: any) => dayKey(new Date(c.created_at)) === key);
+      return {
+        day,
+        challans: todays.length,
+        qty: todays.reduce((sum: number, c: any) => sum + (c.total_quantity || 0), 0),
+      };
+    });
+    const movementsTrend = days.map(({ key, day }) => {
+      const todays = recentMovements.filter((m: any) => dayKey(new Date(m.created_at)) === key);
+      return {
+        day,
+        stock_in: todays.filter((m: any) => m.movement_type === 'IN').reduce((s: number, m: any) => s + m.quantity_changed, 0),
+        stock_out: todays.filter((m: any) => m.movement_type === 'OUT').reduce((s: number, m: any) => s + m.quantity_changed, 0),
+      };
+    });
+
+    const [lowStockList, recent] = await Promise.all([
+      Product.find({ $expr: { $lte: ['$current_stock', '$min_stock_alert'] } })
+        .sort({ current_stock: 1 })
+        .limit(5)
+        .lean(),
+      Challan.find().sort({ created_at: -1 }).limit(6).lean(),
+    ]);
+    const custIds = [...new Set(recent.map((c: any) => String(c.customer_id)))];
+    const custs = await Customer.find({ _id: { $in: custIds } }).lean();
+    const cMap = new Map(custs.map((c: any) => [String(c._id), c.customer_name]));
+
+    return res.status(200).json({
+      stats: {
+        customers,
+        products,
+        challans,
+        draftChallans,
+        lowStock,
+        inventoryValue: invAgg[0]?.total ?? 0,
+      },
       challansByStatus,
       customersByType,
       customersByStatus,
       stockByCategory,
       challansTrend,
       movementsTrend,
-      lowStock,
-      recentChallans,
-    ] = await Promise.all([
-      pool.query(`
-        SELECT
-          (SELECT COUNT(*) FROM customers) AS customers,
-          (SELECT COUNT(*) FROM products) AS products,
-          (SELECT COUNT(*) FROM challans) AS challans,
-          (SELECT COUNT(*) FROM challans WHERE status = 'Draft') AS draft_challans,
-          (SELECT COUNT(*) FROM products WHERE current_stock <= min_stock_alert) AS low_stock,
-          (SELECT COALESCE(SUM(unit_price * current_stock), 0) FROM products) AS inventory_value
-      `),
-      pool.query(`SELECT status AS name, COUNT(*)::int AS value FROM challans GROUP BY status`),
-      pool.query(`SELECT customer_type AS name, COUNT(*)::int AS value FROM customers GROUP BY customer_type`),
-      pool.query(`SELECT status AS name, COUNT(*)::int AS value FROM customers GROUP BY status`),
-      pool.query(`
-        SELECT COALESCE(NULLIF(category, ''), 'Uncategorized') AS name,
-               COALESCE(SUM(current_stock), 0)::int AS stock,
-               COALESCE(SUM(unit_price * current_stock), 0)::float AS value
-        FROM products GROUP BY category ORDER BY value DESC
-      `),
-      pool.query(`
-        SELECT TO_CHAR(d.day, 'Mon DD') AS day,
-               COUNT(c.id)::int AS challans,
-               COALESCE(SUM(c.total_quantity), 0)::int AS qty
-        FROM (SELECT CURRENT_DATE - s AS day FROM generate_series(0, 13) s) d
-        LEFT JOIN challans c ON DATE(c.created_at) = d.day
-        GROUP BY d.day ORDER BY MIN(d.day)
-      `),
-      pool.query(`
-        SELECT TO_CHAR(d.day, 'Mon DD') AS day,
-               COALESCE(SUM(CASE WHEN sm.movement_type = 'IN' THEN sm.quantity_changed ELSE 0 END), 0)::int AS stock_in,
-               COALESCE(SUM(CASE WHEN sm.movement_type = 'OUT' THEN sm.quantity_changed ELSE 0 END), 0)::int AS stock_out
-        FROM (SELECT CURRENT_DATE - s AS day FROM generate_series(0, 13) s) d
-        LEFT JOIN stock_movements sm ON DATE(sm.created_at) = d.day
-        GROUP BY d.day ORDER BY MIN(d.day)
-      `),
-      pool.query(`
-        SELECT id, product_name, sku, current_stock, min_stock_alert, category
-        FROM products ORDER BY current_stock ASC LIMIT 5
-      `),
-      pool.query(`
-        SELECT c.id, c.challan_number, c.status, c.total_quantity, c.created_at, cu.customer_name
-        FROM challans c LEFT JOIN customers cu ON c.customer_id = cu.id
-        ORDER BY c.created_at DESC LIMIT 6
-      `),
-    ]);
-
-    return res.status(200).json({
-      stats: {
-        customers: parseInt(counts.rows[0].customers),
-        products: parseInt(counts.rows[0].products),
-        challans: parseInt(counts.rows[0].challans),
-        draftChallans: parseInt(counts.rows[0].draft_challans),
-        lowStock: parseInt(counts.rows[0].low_stock),
-        inventoryValue: parseFloat(counts.rows[0].inventory_value),
-      },
-      challansByStatus: challansByStatus.rows,
-      customersByType: customersByType.rows,
-      customersByStatus: customersByStatus.rows,
-      stockByCategory: stockByCategory.rows,
-      challansTrend: challansTrend.rows,
-      movementsTrend: movementsTrend.rows,
-      lowStock: lowStock.rows,
-      recentChallans: recentChallans.rows,
+      lowStock: lowStockList.map((p: any) => ({
+        id: String(p._id),
+        product_name: p.product_name,
+        sku: p.sku,
+        current_stock: p.current_stock,
+        min_stock_alert: p.min_stock_alert,
+      })),
+      recentChallans: recent.map((c: any) => ({
+        id: String(c._id),
+        challan_number: c.challan_number,
+        customer_name: cMap.get(String(c.customer_id)) ?? null,
+        status: c.status,
+        total_quantity: c.total_quantity,
+        created_at: c.created_at,
+      })),
     });
   } catch (err) {
     console.error('dashboardAnalytics error:', err);

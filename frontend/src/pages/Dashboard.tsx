@@ -17,8 +17,8 @@ interface Analytics {
   stockByCategory: { name: string; stock: number; value: number }[];
   challansTrend: { day: string; challans: number; qty: number }[];
   movementsTrend: { day: string; stock_in: number; stock_out: number }[];
-  lowStock: { id: number; product_name: string; sku: string; current_stock: number; min_stock_alert: number }[];
-  recentChallans: { id: number; challan_number: string; customer_name: string; status: string; total_quantity: number; created_at: string }[];
+  lowStock: { id: string; product_name: string; sku: string; current_stock: number; min_stock_alert: number }[];
+  recentChallans: { id: string; challan_number: string; customer_name: string; status: string; total_quantity: number; created_at: string }[];
 }
 
 const COLORS = ['#6366f1', '#10b981', '#f59e0b', '#f43f5e', '#0ea5e9', '#8b5cf6'];

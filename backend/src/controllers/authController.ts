@@ -1,10 +1,10 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { pool } from '../config/db';
+import { User, toClient, isId } from '../models/store';
 import { env } from '../config/env';
 
-const toPublicUser = (u: any) => ({ id: u.id, name: u.name, email: u.email, role: u.role });
+const toPublicUser = (u: any) => ({ id: String(u._id ?? u.id), name: u.name, email: u.email, role: u.role });
 
 export const login = async (req: Request, res: Response) => {
   try {
@@ -16,10 +16,8 @@ export const login = async (req: Request, res: Response) => {
     }
     const normalizedEmail = String(email).trim().toLowerCase();
 
-    // 2. Look up the user by email
-    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [normalizedEmail]);
-    const user = result.rows[0];
-
+    // 2. Look up the user by email (case-insensitive — stored lowercase)
+    const user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       // Deliberately vague message — never reveal whether it was the
       // email or password that was wrong. That's a security best practice.
@@ -34,7 +32,7 @@ export const login = async (req: Request, res: Response) => {
 
     // 4. Build the JWT — this is what proves "I'm logged in" on future requests
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id: String(user._id), email: user.email, role: user.role },
       env.jwtSecret,
       { expiresIn: env.jwtExpiresIn as jwt.SignOptions['expiresIn'] }
     );
@@ -53,17 +51,14 @@ export const register = async (req: Request, res: Response) => {
     const { name, email, password, role } = req.body;
     const normalizedEmail = String(email).trim().toLowerCase();
 
-    const exists = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1', [normalizedEmail]);
-    if (exists.rows.length > 0) {
+    const exists = await User.findOne({ email: normalizedEmail });
+    if (exists) {
       return res.status(409).json({ error: 'A user with this email already exists' });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role) VALUES ($1,$2,$3,$4) RETURNING id, name, email, role`,
-      [String(name).trim(), normalizedEmail, passwordHash, role]
-    );
-    return res.status(201).json({ data: result.rows[0] });
+    const user = await User.create({ name: String(name).trim(), email: normalizedEmail, password_hash: passwordHash, role });
+    return res.status(201).json({ data: toPublicUser(user) });
   } catch (err) {
     console.error('Register error:', err);
     return res.status(500).json({ error: 'Failed to create user' });
@@ -82,19 +77,15 @@ export const signup = async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Admin role can only be granted by an existing admin' });
     }
 
-    const exists = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1', [normalizedEmail]);
-    if (exists.rows.length > 0) {
+    const exists = await User.findOne({ email: normalizedEmail });
+    if (exists) {
       return res.status(409).json({ error: 'An account with this email already exists. Try signing in.' });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const result = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role) VALUES ($1,$2,$3,$4) RETURNING id, name, email, role`,
-      [String(name).trim(), normalizedEmail, passwordHash, safeRole]
-    );
-    const user = result.rows[0];
+    const user = await User.create({ name: String(name).trim(), email: normalizedEmail, password_hash: passwordHash, role: safeRole });
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id: String(user._id), email: user.email, role: user.role },
       env.jwtSecret,
       { expiresIn: env.jwtExpiresIn as jwt.SignOptions['expiresIn'] }
     );
@@ -108,11 +99,11 @@ export const signup = async (req: Request, res: Response) => {
 // GET /auth/me — frontend validates the stored token on boot.
 export const me = async (req: Request, res: Response) => {
   try {
-    const result = await pool.query('SELECT id, name, email, role, created_at FROM users WHERE id = $1', [req.user!.id]);
-    if (result.rows.length === 0) {
+    const user = await User.findById(req.user!.id, { password_hash: 0 }).lean();
+    if (!user) {
       return res.status(401).json({ error: 'User no longer exists' });
     }
-    return res.status(200).json({ data: result.rows[0] });
+    return res.status(200).json({ data: toClient(user) });
   } catch (err) {
     console.error('Me error:', err);
     return res.status(500).json({ error: 'Failed to load profile' });
@@ -122,8 +113,8 @@ export const me = async (req: Request, res: Response) => {
 // GET /auth/users — admin lists all users.
 export const listUsers = async (_req: Request, res: Response) => {
   try {
-    const result = await pool.query('SELECT id, name, email, role, created_at FROM users ORDER BY created_at ASC');
-    return res.status(200).json({ data: result.rows });
+    const users = await User.find({}, { password_hash: 0 }).sort({ created_at: 1 }).lean();
+    return res.status(200).json({ data: users.map(toClient) });
   } catch (err) {
     console.error('listUsers error:', err);
     return res.status(500).json({ error: 'Failed to load users' });
@@ -134,15 +125,14 @@ export const listUsers = async (_req: Request, res: Response) => {
 export const changePassword = async (req: Request, res: Response) => {
   try {
     const { currentPassword, newPassword } = req.body;
-    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user!.id]);
-    const user = result.rows[0];
+    const user = await User.findById(req.user!.id);
     if (!user) return res.status(401).json({ error: 'User no longer exists' });
 
     const ok = await bcrypt.compare(currentPassword, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
 
-    const passwordHash = await bcrypt.hash(newPassword, 12);
-    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, user.id]);
+    user.password_hash = await bcrypt.hash(newPassword, 12);
+    await user.save();
     return res.status(200).json({ message: 'Password changed' });
   } catch (err) {
     console.error('changePassword error:', err);
@@ -154,22 +144,17 @@ export const changePassword = async (req: Request, res: Response) => {
 // Guards: cannot demote yourself (prevents accidental lockout with zero admins).
 export const updateUserRole = async (req: Request, res: Response) => {
   try {
-    const targetId = parseInt(req.params.id, 10);
+    const targetId = req.params.id;
     const { role } = req.body;
-    if (!targetId) return res.status(400).json({ error: 'Invalid user id' });
+    if (!isId(targetId)) return res.status(404).json({ error: 'User not found' });
 
     if (req.user!.id === targetId && role !== 'admin') {
       return res.status(400).json({ error: 'You cannot remove your own admin role' });
     }
 
-    const exists = await pool.query('SELECT id FROM users WHERE id = $1', [targetId]);
-    if (exists.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-
-    const result = await pool.query(
-      'UPDATE users SET role = $1 WHERE id = $2 RETURNING id, name, email, role',
-      [role, targetId]
-    );
-    return res.status(200).json({ data: result.rows[0] });
+    const user = await User.findByIdAndUpdate(targetId, { role }, { new: true, runValidators: true });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    return res.status(200).json({ data: toPublicUser(user) });
   } catch (err) {
     console.error('updateUserRole error:', err);
     return res.status(500).json({ error: 'Failed to update role' });

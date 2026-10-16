@@ -1,44 +1,34 @@
 import { Request, Response } from 'express';
-import { pool } from '../config/db';
+import { Customer, Challan, toClient, isId } from '../models/store';
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const pageParams = (req: Request, def = 10) => {
+  const pageNum = Math.max(parseInt(req.query.page as string) || 1, 1);
+  const limitNum = Math.min(Math.max(parseInt(req.query.limit as string) || def, 1), 100);
+  return { pageNum, limitNum, skip: (pageNum - 1) * limitNum };
+};
 
 // GET /customers?search=&status=&page=&limit=
 export const getCustomers = async (req: Request, res: Response) => {
   try {
-    const { search = '', status, page = '1', limit = '10' } = req.query;
-    const pageNum = Math.max(parseInt(page as string) || 1, 1);
-    const limitNum = Math.max(parseInt(limit as string) || 10, 1);
-    const offset = (pageNum - 1) * limitNum;
+    const { search = '', status } = req.query;
+    const { pageNum, limitNum, skip } = pageParams(req);
 
-    const conditions: string[] = [];
-    const values: any[] = [];
-
+    const filter: any = {};
     if (search) {
-      values.push(`%${search}%`);
-      conditions.push(
-        `(customer_name ILIKE $${values.length} OR mobile_number ILIKE $${values.length} OR business_name ILIKE $${values.length})`
-      );
+      const rx = new RegExp(escapeRegExp(String(search)), 'i');
+      filter.$or = [{ customer_name: rx }, { mobile_number: rx }, { business_name: rx }];
     }
-    if (status) {
-      values.push(status);
-      conditions.push(`status = $${values.length}`);
-    }
+    if (status) filter.status = status;
 
-    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    const countResult = await pool.query(
-      `SELECT COUNT(*) FROM customers ${whereClause}`,
-      values
-    );
-    const total = parseInt(countResult.rows[0].count);
-
-    values.push(limitNum, offset);
-    const result = await pool.query(
-      `SELECT * FROM customers ${whereClause} ORDER BY created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
-    );
+    const [total, rows] = await Promise.all([
+      Customer.countDocuments(filter),
+      Customer.find(filter).sort({ created_at: -1 }).skip(skip).limit(limitNum).lean(),
+    ]);
 
     return res.status(200).json({
-      data: result.rows,
+      data: rows.map(toClient),
       pagination: { total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) },
     });
   } catch (err) {
@@ -47,17 +37,13 @@ export const getCustomers = async (req: Request, res: Response) => {
   }
 };
 
-// GET /customers/:id  -> includes follow-up notes
+// GET /customers/:id
 export const getCustomerById = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const customerResult = await pool.query('SELECT * FROM customers WHERE id = $1', [id]);
-
-    if (customerResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Customer not found' });
-    }
-
-    return res.status(200).json({ data: customerResult.rows[0] });
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Customer not found' });
+    const customer = await Customer.findById(req.params.id).lean();
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    return res.status(200).json({ data: toClient(customer) });
   } catch (err) {
     console.error('getCustomerById error:', err);
     return res.status(500).json({ error: 'Failed to fetch customer' });
@@ -79,56 +65,33 @@ export const createCustomer = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'customer_type must be Retail, Wholesale or Distributor' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO customers
-        (customer_name, mobile_number, email, business_name, gst_number, customer_type, address, status, follow_up_date, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING *`,
-      [customer_name, mobile_number, email || null, business_name || null, gst_number || null,
-       customer_type, address || null, status || 'Lead', follow_up_date || null, notes || null]
-    );
+    const customer = await Customer.create({
+      customer_name, mobile_number, email: email || null, business_name: business_name || null,
+      gst_number: gst_number || null, customer_type, address: address || null,
+      status: status || 'Lead', follow_up_date: follow_up_date || null, notes: notes || null,
+    });
 
-    return res.status(201).json({ data: result.rows[0] });
+    return res.status(201).json({ data: toClient(customer.toObject()) });
   } catch (err) {
     console.error('createCustomer error:', err);
     return res.status(500).json({ error: 'Failed to create customer' });
   }
 };
 
-// PUT /customers/:id
+// PUT /customers/:id — only provided fields are updated
 export const updateCustomer = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const {
-      customer_name, mobile_number, email, business_name,
-      gst_number, customer_type, address, status, follow_up_date, notes,
-    } = req.body;
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Customer not found' });
+    const allowed = [
+      'customer_name', 'mobile_number', 'email', 'business_name', 'gst_number',
+      'customer_type', 'address', 'status', 'follow_up_date', 'notes',
+    ];
+    const set: any = {};
+    for (const k of allowed) if (req.body[k] !== undefined) set[k] = req.body[k];
 
-    const existing = await pool.query('SELECT * FROM customers WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Customer not found' });
-    }
-
-    const result = await pool.query(
-      `UPDATE customers SET
-        customer_name = COALESCE($1, customer_name),
-        mobile_number = COALESCE($2, mobile_number),
-        email = COALESCE($3, email),
-        business_name = COALESCE($4, business_name),
-        gst_number = COALESCE($5, gst_number),
-        customer_type = COALESCE($6, customer_type),
-        address = COALESCE($7, address),
-        status = COALESCE($8, status),
-        follow_up_date = COALESCE($9, follow_up_date),
-        notes = COALESCE($10, notes),
-        updated_at = NOW()
-       WHERE id = $11
-       RETURNING *`,
-      [customer_name, mobile_number, email, business_name, gst_number,
-       customer_type, address, status, follow_up_date, notes, id]
-    );
-
-    return res.status(200).json({ data: result.rows[0] });
+    const customer = await Customer.findByIdAndUpdate(req.params.id, { $set: set }, { new: true, runValidators: true }).lean();
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    return res.status(200).json({ data: toClient(customer) });
   } catch (err) {
     console.error('updateCustomer error:', err);
     return res.status(500).json({ error: 'Failed to update customer' });
@@ -138,30 +101,18 @@ export const updateCustomer = async (req: Request, res: Response) => {
 // POST /customers/:id/notes  -> quick follow-up note append
 export const addFollowUpNote = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Customer not found' });
     const { note } = req.body;
+    if (!note) return res.status(400).json({ error: 'note is required' });
 
-    if (!note) {
-      return res.status(400).json({ error: 'note is required' });
-    }
-
-    const existing = await pool.query('SELECT notes FROM customers WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Customer not found' });
-    }
+    const customer = await Customer.findById(req.params.id);
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
     const timestamp = new Date().toISOString();
-    const previousNotes = existing.rows[0].notes || '';
-    const updatedNotes = previousNotes
-      ? `${previousNotes}\n[${timestamp}] ${note}`
-      : `[${timestamp}] ${note}`;
+    customer.notes = customer.notes ? `${customer.notes}\n[${timestamp}] ${note}` : `[${timestamp}] ${note}`;
+    await customer.save();
 
-    const result = await pool.query(
-      'UPDATE customers SET notes = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-      [updatedNotes, id]
-    );
-
-    return res.status(200).json({ data: result.rows[0] });
+    return res.status(200).json({ data: toClient(customer.toObject()) });
   } catch (err) {
     console.error('addFollowUpNote error:', err);
     return res.status(500).json({ error: 'Failed to add follow-up note' });
@@ -171,18 +122,18 @@ export const addFollowUpNote = async (req: Request, res: Response) => {
 // DELETE /customers/:id
 export const deleteCustomer = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const existing = await pool.query('SELECT id FROM customers WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Customer not found' });
-    }
-    await pool.query('DELETE FROM customers WHERE id = $1', [id]);
-    return res.status(200).json({ message: 'Customer deleted' });
-  } catch (err: any) {
-    // Referenced by a challan -> FK violation
-    if (err.code === '23503') {
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Customer not found' });
+    const customer = await Customer.findById(req.params.id);
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const hasChallans = await Challan.exists({ customer_id: customer._id });
+    if (hasChallans) {
       return res.status(409).json({ error: 'Cannot delete: customer has challans. Set status to Inactive instead.' });
     }
+
+    await customer.deleteOne();
+    return res.status(200).json({ message: 'Customer deleted' });
+  } catch (err) {
     console.error('deleteCustomer error:', err);
     return res.status(500).json({ error: 'Failed to delete customer' });
   }

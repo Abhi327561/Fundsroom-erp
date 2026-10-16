@@ -9,7 +9,7 @@ import { useDebounce } from '../hooks/useDebounce';
 import { useAuth } from '../context/AuthContext';
 
 interface Product {
-  id: number;
+  id: string;
   product_name: string;
   sku: string;
   category: string | null;
@@ -20,7 +20,7 @@ interface Product {
 }
 
 interface Movement {
-  id: number;
+  id: string;
   quantity_changed: number;
   movement_type: 'IN' | 'OUT';
   reason: string | null;

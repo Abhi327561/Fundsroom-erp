@@ -5,8 +5,8 @@ import { useToast } from '../components/Toast';
 import { SkeletonTable } from '../components/Skeleton';
 
 interface Movement {
-  id: number;
-  product_id: number;
+  id: string;
+  product_id: string;
   product_name: string | null;
   sku: string | null;
   quantity_changed: number;

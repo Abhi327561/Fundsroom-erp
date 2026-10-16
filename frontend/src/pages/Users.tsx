@@ -8,7 +8,7 @@ import { SkeletonTable } from '../components/Skeleton';
 import { useAuth } from '../context/AuthContext';
 
 interface AppUser {
-  id: number;
+  id: string;
   name: string;
   email: string;
   role: string;

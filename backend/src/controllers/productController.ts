@@ -1,42 +1,35 @@
 import { Request, Response } from 'express';
-import { pool } from '../config/db';
+import { Product, StockMovement, Challan, User, toClient, isId } from '../models/store';
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const pageParams = (req: Request, def = 10) => {
+  const pageNum = Math.max(parseInt(req.query.page as string) || 1, 1);
+  const limitNum = Math.min(Math.max(parseInt(req.query.limit as string) || def, 1), 100);
+  return { pageNum, limitNum, skip: (pageNum - 1) * limitNum };
+};
 
 // GET /products?search=&category=&lowStock=true&page=&limit=
 export const getProducts = async (req: Request, res: Response) => {
   try {
-    const { search = '', category, lowStock, page = '1', limit = '10' } = req.query;
-    const pageNum = Math.max(parseInt(page as string) || 1, 1);
-    const limitNum = Math.max(parseInt(limit as string) || 10, 1);
-    const offset = (pageNum - 1) * limitNum;
+    const { search = '', category, lowStock } = req.query;
+    const { pageNum, limitNum, skip } = pageParams(req);
 
-    const conditions: string[] = [];
-    const values: any[] = [];
-
+    const filter: any = {};
     if (search) {
-      values.push(`%${search}%`);
-      conditions.push(`(product_name ILIKE $${values.length} OR sku ILIKE $${values.length})`);
+      const rx = new RegExp(escapeRegExp(String(search)), 'i');
+      filter.$or = [{ product_name: rx }, { sku: rx }];
     }
-    if (category) {
-      values.push(category);
-      conditions.push(`category = $${values.length}`);
-    }
-    if (lowStock === 'true') {
-      conditions.push(`current_stock <= min_stock_alert`);
-    }
+    if (category) filter.category = category;
+    if (lowStock === 'true') filter.$expr = { $lte: ['$current_stock', '$min_stock_alert'] };
 
-    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    const countResult = await pool.query(`SELECT COUNT(*) FROM products ${whereClause}`, values);
-    const total = parseInt(countResult.rows[0].count);
-
-    values.push(limitNum, offset);
-    const result = await pool.query(
-      `SELECT * FROM products ${whereClause} ORDER BY created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
-    );
+    const [total, rows] = await Promise.all([
+      Product.countDocuments(filter),
+      Product.find(filter).sort({ created_at: -1 }).skip(skip).limit(limitNum).lean(),
+    ]);
 
     return res.status(200).json({
-      data: result.rows,
+      data: rows.map(toClient),
       pagination: { total, page: pageNum, limit: limitNum, totalPages: Math.ceil(total / limitNum) },
     });
   } catch (err) {
@@ -48,12 +41,10 @@ export const getProducts = async (req: Request, res: Response) => {
 // GET /products/:id
 export const getProductById = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const result = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
-    }
-    return res.status(200).json({ data: result.rows[0] });
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Product not found' });
+    const product = await Product.findById(req.params.id).lean();
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    return res.status(200).json({ data: toClient(product) });
   } catch (err) {
     console.error('getProductById error:', err);
     return res.status(500).json({ error: 'Failed to fetch product' });
@@ -63,10 +54,7 @@ export const getProductById = async (req: Request, res: Response) => {
 // POST /products
 export const createProduct = async (req: Request, res: Response) => {
   try {
-    const {
-      product_name, sku, category, unit_price,
-      current_stock, min_stock_alert, warehouse_location,
-    } = req.body;
+    const { product_name, sku, category, unit_price, current_stock, min_stock_alert, warehouse_location } = req.body;
 
     if (!product_name || !sku || unit_price === undefined) {
       return res.status(400).json({ error: 'product_name, sku and unit_price are required' });
@@ -75,18 +63,15 @@ export const createProduct = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'unit_price cannot be negative' });
     }
 
-    const result = await pool.query(
-      `INSERT INTO products
-        (product_name, sku, category, unit_price, current_stock, min_stock_alert, warehouse_location)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING *`,
-      [product_name, sku, category || null, unit_price,
-       current_stock || 0, min_stock_alert || 0, warehouse_location || null]
-    );
+    const product = await Product.create({
+      product_name, sku, category: category || null, unit_price,
+      current_stock: current_stock || 0, min_stock_alert: min_stock_alert || 0,
+      warehouse_location: warehouse_location || null,
+    });
 
-    return res.status(201).json({ data: result.rows[0] });
+    return res.status(201).json({ data: toClient(product.toObject()) });
   } catch (err: any) {
-    if (err.code === '23505') { // Postgres unique violation (duplicate SKU)
+    if (err.code === 11000) {
       return res.status(409).json({ error: 'A product with this SKU already exists' });
     }
     console.error('createProduct error:', err);
@@ -94,31 +79,17 @@ export const createProduct = async (req: Request, res: Response) => {
   }
 };
 
-// PUT /products/:id  (does NOT change current_stock directly -- use /stock-movements for that)
+// PUT /products/:id  (does NOT change current_stock directly -- use stock movements for that)
 export const updateProduct = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const { product_name, category, unit_price, min_stock_alert, warehouse_location } = req.body;
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Product not found' });
+    const allowed = ['product_name', 'category', 'unit_price', 'min_stock_alert', 'warehouse_location'];
+    const set: any = {};
+    for (const k of allowed) if (req.body[k] !== undefined) set[k] = req.body[k];
 
-    const existing = await pool.query('SELECT * FROM products WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
-    }
-
-    const result = await pool.query(
-      `UPDATE products SET
-        product_name = COALESCE($1, product_name),
-        category = COALESCE($2, category),
-        unit_price = COALESCE($3, unit_price),
-        min_stock_alert = COALESCE($4, min_stock_alert),
-        warehouse_location = COALESCE($5, warehouse_location),
-        updated_at = NOW()
-       WHERE id = $6
-       RETURNING *`,
-      [product_name, category, unit_price, min_stock_alert, warehouse_location, id]
-    );
-
-    return res.status(200).json({ data: result.rows[0] });
+    const product = await Product.findByIdAndUpdate(req.params.id, { $set: set }, { new: true, runValidators: true }).lean();
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    return res.status(200).json({ data: toClient(product) });
   } catch (err) {
     console.error('updateProduct error:', err);
     return res.status(500).json({ error: 'Failed to update product' });
@@ -126,91 +97,86 @@ export const updateProduct = async (req: Request, res: Response) => {
 };
 
 // POST /products/:id/stock-movements  -> adjust stock with an audit trail entry
-// This is the ONLY way stock should change outside of challan confirmation.
+// The stock check + decrement is one atomic update, so concurrent requests can't oversell.
 export const addStockMovement = async (req: Request, res: Response) => {
-  const client = await pool.connect();
   try {
-    const { id } = req.params;
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Product not found' });
     const { quantity_changed, movement_type, reason } = req.body;
     const userId = req.user?.id;
 
-    if (!quantity_changed || quantity_changed <= 0) {
+    const qty = Number(quantity_changed);
+    if (!qty || qty <= 0) {
       return res.status(400).json({ error: 'quantity_changed must be a positive number' });
     }
     if (!['IN', 'OUT'].includes(movement_type)) {
       return res.status(400).json({ error: 'movement_type must be IN or OUT' });
     }
 
-    await client.query('BEGIN');
-
-    const productResult = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [id]);
-    if (productResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Product not found' });
-    }
-    const product = productResult.rows[0];
-
-    const newStock = movement_type === 'IN'
-      ? product.current_stock + quantity_changed
-      : product.current_stock - quantity_changed;
-
-    if (newStock < 0) {
-      await client.query('ROLLBACK');
+    const delta = movement_type === 'IN' ? qty : -qty;
+    // For OUT, only match when stock is sufficient — atomic guard, no oversell.
+    const product = await Product.findOneAndUpdate(
+      movement_type === 'IN'
+        ? { _id: req.params.id }
+        : { _id: req.params.id, current_stock: { $gte: qty } },
+      { $inc: { current_stock: delta } },
+      { new: true }
+    ).lean();
+    if (!product) {
+      const exists = await Product.exists({ _id: req.params.id });
+      if (!exists) return res.status(404).json({ error: 'Product not found' });
       return res.status(400).json({ error: 'Insufficient stock for this OUT movement' });
     }
 
-    await client.query('UPDATE products SET current_stock = $1, updated_at = NOW() WHERE id = $2', [newStock, id]);
+    const movement = await StockMovement.create({
+      product_id: product._id, quantity_changed: qty, movement_type, reason: reason || null, created_by: userId || null,
+    });
 
-    const movementResult = await client.query(
-      `INSERT INTO stock_movements (product_id, quantity_changed, movement_type, reason, created_by)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [id, quantity_changed, movement_type, reason || null, userId]
-    );
-
-    await client.query('COMMIT');
-    return res.status(201).json({ data: movementResult.rows[0], new_stock: newStock });
+    return res.status(201).json({ data: toClient(movement.toObject()), new_stock: product.current_stock });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('addStockMovement error:', err);
     return res.status(500).json({ error: 'Failed to record stock movement' });
-  } finally {
-    client.release();
   }
 };
 
 // GET /products/:id/stock-movements
 export const getStockMovements = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const result = await pool.query(
-      `SELECT sm.*, u.name as created_by_name
-       FROM stock_movements sm
-       LEFT JOIN users u ON sm.created_by = u.id
-       WHERE sm.product_id = $1
-       ORDER BY sm.created_at DESC`,
-      [id]
-    );
-    return res.status(200).json({ data: result.rows });
+    if (!isId(req.params.id)) return res.status(200).json({ data: [] });
+    const movements = await StockMovement.find({ product_id: req.params.id }).sort({ created_at: -1 }).lean();
+    const userIds = [...new Set(movements.map((m: any) => String(m.created_by)).filter(Boolean))];
+    const users = await User.find({ _id: { $in: userIds } }).lean();
+    const names = new Map(users.map((u: any) => [String(u._id), u.name]));
+    return res.status(200).json({
+      data: movements.map((m: any) => ({ ...toClient(m), created_by_name: m.created_by ? names.get(String(m.created_by)) ?? null : null })),
+    });
   } catch (err) {
     console.error('getStockMovements error:', err);
     return res.status(500).json({ error: 'Failed to fetch stock movements' });
   }
 };
 
-// GET /products-movements/all?limit=50 — global recent stock history for the Stock page + Dashboard
+// GET /products/movements/all?limit=50 — global recent stock history
 export const getAllStockMovements = async (req: Request, res: Response) => {
   try {
     const limitNum = Math.min(Math.max(parseInt(req.query.limit as string) || 50, 1), 200);
-    const result = await pool.query(
-      `SELECT sm.*, p.product_name, p.sku, u.name as created_by_name
-       FROM stock_movements sm
-       LEFT JOIN products p ON sm.product_id = p.id
-       LEFT JOIN users u ON sm.created_by = u.id
-       ORDER BY sm.created_at DESC
-       LIMIT $1`,
-      [limitNum]
-    );
-    return res.status(200).json({ data: result.rows });
+    const [movements, products, users] = await Promise.all([
+      StockMovement.find().sort({ created_at: -1 }).limit(limitNum).lean(),
+      Product.find({}, { product_name: 1, sku: 1 }).lean(),
+      User.find({}, { name: 1 }).lean(),
+    ]);
+    const pMap = new Map(products.map((p: any) => [String(p._id), p]));
+    const uMap = new Map(users.map((u: any) => [String(u._id), u.name]));
+    return res.status(200).json({
+      data: movements.map((m: any) => {
+        const p = pMap.get(String(m.product_id));
+        return {
+          ...toClient(m),
+          product_name: p?.product_name ?? null,
+          sku: p?.sku ?? null,
+          created_by_name: m.created_by ? uMap.get(String(m.created_by)) ?? null : null,
+        };
+      }),
+    });
   } catch (err) {
     console.error('getAllStockMovements error:', err);
     return res.status(500).json({ error: 'Failed to fetch stock history' });
@@ -220,17 +186,19 @@ export const getAllStockMovements = async (req: Request, res: Response) => {
 // DELETE /products/:id
 export const deleteProduct = async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const existing = await pool.query('SELECT id FROM products WHERE id = $1', [id]);
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
-    }
-    await pool.query('DELETE FROM products WHERE id = $1', [id]);
-    return res.status(200).json({ message: 'Product deleted' });
-  } catch (err: any) {
-    if (err.code === '23503') {
+    if (!isId(req.params.id)) return res.status(404).json({ error: 'Product not found' });
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    const usedInChallan = await Challan.exists({ 'items.product_id': product._id });
+    const hasMovements = await StockMovement.exists({ product_id: product._id });
+    if (usedInChallan || hasMovements) {
       return res.status(409).json({ error: 'Cannot delete: product is used in challans or stock movements.' });
     }
+
+    await product.deleteOne();
+    return res.status(200).json({ message: 'Product deleted' });
+  } catch (err) {
     console.error('deleteProduct error:', err);
     return res.status(500).json({ error: 'Failed to delete product' });
   }
